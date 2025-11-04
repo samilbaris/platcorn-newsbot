@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Platcorn NewsBot – tek dosya (anti-duplicate hardened + persistent seen)
-- Sadece anahtar kelime eşleşen haberleri yollar (başlık + opsiyonel gövde araması).
-- Eski haberleri atlar (MAX_AGE_HOURS).
-- Tekrar göndermez: canonical URL + normalize_link + sqlite 'seen' + 'seen_link'
-  + run_seen_sets + PERSISTENT REPO seen (data/seen_urls.txt + git commit/push).
-- Başlık/özet Türkçeleştirme (GoogleTranslator) + özet (sumy LSA).
-- HTML güvenliği (escape) + Telegram HTML parse_mode.
-- healthchecks.io pingi Python’dan atar (/start, /fail, başarı).
+Platcorn NewsBot – anti-duplicate MAX (URL + canonical + title-fingerprint)
+- Yalnızca anahtar kelimeli haberler
+- Eski haberleri atlar (MAX_AGE_HOURS)
+- Dedupe:
+  * normalize_link (takip parametrelerini atar)
+  * canonical URL
+  * sqlite: seen (id), seen_link (link), seen_title (publisher+title_fp)
+  * run içi set’ler
+  * (opsiyonel) repo kalıcı state (data/seen_urls.txt)
+- TR başlık/özet (GoogleTranslator) + LSA özet
+- Telegram HTML güvenli gönderim
+- healthchecks.io pingi (/start, success, /fail)
 """
 
 import os, re, time, sqlite3, html, subprocess
@@ -18,7 +22,7 @@ from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 import feedparser, requests
 from deep_translator import GoogleTranslator
 
-# Özetleme & NLTK
+# Özet & NLTK
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer
@@ -32,9 +36,8 @@ except LookupError:
 from newspaper import Article
 
 # =======================
-# KULLANICI AYARLARI
+# AYARLAR
 # =======================
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -44,8 +47,8 @@ SUMMARY_SENTENCES    = 4
 TRANSLATE_TITLES     = True
 TRANSLATE_SUMMARIES  = True
 
-STRICT_KEYWORDS   = True       # sadece filtreye uyanlar
-SEARCH_IN_SUMMARY = False      # gövde araması (gürültü için kapalı)
+STRICT_KEYWORDS   = True
+SEARCH_IN_SUMMARY = False
 MAX_AGE_HOURS     = 24
 
 APP_DIR = os.path.join(os.path.expanduser("~"), ".newsbot")
@@ -54,7 +57,6 @@ DB_PATH = os.path.join(APP_DIR, "seen.db")
 # =======================
 # ANAHTAR KELİMELER
 # =======================
-
 GLOBAL_KEYWORDS = [
     "youtube","twitch","kick","tiktok","instagram","x.com","threads","rumble",
     "livestream","stream","streamer","creator","influencer","content creator",
@@ -160,8 +162,15 @@ CATEGORIES = {
 }
 
 # =======================
-# ARAÇLAR
+# DB & STATE
 # =======================
+
+TRACKING_PARAMS = {
+    "utm_source","utm_medium","utm_campaign","utm_term","utm_content","utm_id",
+    "gclid","fbclid","mc_cid","mc_eid","ref","ref_src","igshid","si","s",
+    "feature","spm","msclkid","yclid","cmp","cmpid","ocid","rb_clickid",
+    "outputType","share","share_id","ranMID","ranEAID","ranSiteID","irgwc",
+}
 
 def log(msg: str):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -187,6 +196,15 @@ def init_db():
             ts   INTEGER
         )
     """)
+    # publisher + title_fp birleşik benzersiz
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS seen_title (
+            pk   TEXT PRIMARY KEY,
+            pub  TEXT,
+            tfp  TEXT,
+            ts   INTEGER
+        )
+    """)
     conn.commit()
     return conn
 
@@ -204,13 +222,25 @@ def publisher_of(url: str) -> str:
     return PUBLISHER_MAP.get(host, host)
 
 def normalize_link(url: str) -> str:
+    """http→https, domain lower, path normalize, takip query’leri at, fragment’i sil, trailing slash sil."""
     if not url:
         return url
     try:
         p = urlparse(url.strip())
         scheme = "https" if p.scheme in ("http", "https") else p.scheme
-        q = urlencode(sorted(parse_qsl(p.query, keep_blank_values=True)))
-        return urlunparse((scheme, p.netloc.lower(), p.path, "", q, ""))
+        netloc = p.netloc.lower()
+        # path: çift // -> /, trailing slash kaldır (root hariç)
+        path = re.sub(r"/{2,}", "/", p.path or "")
+        if path.endswith("/") and path != "/":
+            path = path[:-1]
+        # query: tracking param’ları at
+        qpairs = []
+        for k, v in parse_qsl(p.query, keep_blank_values=True):
+            if k.lower() in TRACKING_PARAMS:
+                continue
+            qpairs.append((k, v))
+        query = urlencode(sorted(qpairs))
+        return urlunparse((scheme, netloc, path, "", query, ""))
     except Exception:
         return url
 
@@ -230,19 +260,15 @@ def is_too_old(e) -> bool:
         return True
     return (time.time() - ts) > MAX_AGE_HOURS * 3600
 
-# --- Makale çek ---
 def fetch_article(url: str):
-    """Return (text, canonical_link)"""
+    """(text, canonical_link) döndürür."""
     try:
         art = Article(url)
         art.download(); art.parse()
-        txt   = (art.text or "").strip()
-        canon = (art.canonical_link or "").strip()
-        return txt, canon
+        return (art.text or "").strip(), (art.canonical_link or "").strip()
     except Exception:
         return "", ""
 
-# --- DB dedupe ---
 def link_seen(conn, link: str) -> bool:
     cur = conn.execute("SELECT 1 FROM seen_link WHERE link=?", (link,))
     return cur.fetchone() is not None
@@ -264,7 +290,27 @@ def mark_seen(conn, _id: str, title: str, link: str, category: str):
     )
     conn.commit()
 
-# --- Çeviri/özet ---
+def title_fp(title: str) -> str:
+    """Başlık fingerprint: harf/rakam dışını boşluğa çevir, tek boşluk, lower."""
+    t = (title or "").lower()
+    t = re.sub(r"[^a-z0-9çğıöşü]+", " ", t)  # TR harflerini de tut
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def title_seen(conn, pub: str, t_fp: str) -> bool:
+    pk = f"{pub}::{t_fp}"
+    cur = conn.execute("SELECT 1 FROM seen_title WHERE pk=?", (pk,))
+    return cur.fetchone() is not None
+
+def mark_title_seen(conn, pub: str, t_fp: str):
+    pk = f"{pub}::{t_fp}"
+    conn.execute(
+        "INSERT OR IGNORE INTO seen_title (pk,pub,tfp,ts) VALUES (?,?,?, strftime('%s','now'))",
+        (pk, pub, t_fp)
+    )
+    conn.commit()
+
+# ---------- Çeviri / Özet ----------
 def pretranslate_en(s: str) -> str:
     if not s: return s
     s = re.sub(r"\$?(\d+(\.\d+)?)\s?B\b", r"\1 billion", s, flags=re.IGNORECASE)
@@ -415,11 +461,10 @@ def ping_healthcheck(suffix: str = ""):
         log(f"healthcheck ping başarısız ({suffix}): {e}")
 
 # -----------------------
-# Kalıcı seen (repo içinde)
+# Kalıcı seen (repo)
 # -----------------------
 
 def repo_state_path() -> Path:
-    """Repo içindeki kalıcı state dosyasının yolu (data/seen_urls.txt)."""
     workspace = os.getenv("GITHUB_WORKSPACE", "") or os.getcwd()
     p = Path(workspace) / "data" / "seen_urls.txt"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -439,31 +484,21 @@ def save_repo_seen(seen: set):
     p.write_text("\n".join(sorted(seen)) + "\n", encoding="utf-8")
 
 def repo_commit_push_if_needed():
-    """
-    GHA ortamında data/seen_urls.txt değiştiyse commit + push.
-    PAT_TOKEN varsa onu kullanır; yoksa GITHUB_TOKEN ile dener.
-    """
     if os.getenv("GITHUB_ACTIONS", "").lower() != "true":
         return
-
     repo = os.getenv("GITHUB_REPOSITORY")
     branch = os.getenv("GITHUB_REF_NAME", "main")
     workspace = os.getenv("GITHUB_WORKSPACE", "") or os.getcwd()
     pat = os.getenv("PAT_TOKEN") or os.getenv("GITHUB_TOKEN")
-
     if not repo or not pat:
         return
-
     def run(cmd, cwd=None):
         subprocess.run(cmd, cwd=cwd, shell=True, check=False,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
     run('git config user.name "platcorn-bot"')
     run('git config user.email "bot@users.noreply.github.com"')
-
     run('git add data/seen_urls.txt', cwd=workspace)
     run('git commit -m "chore(bot): update seen urls [skip ci]" || true', cwd=workspace)
-
     remote_url = f"https://{pat}@github.com/{repo}.git"
     run(f'git push "{remote_url}" HEAD:{branch}', cwd=workspace)
 
@@ -480,7 +515,6 @@ def run_once():
     run_seen_links  = set()
     run_seen_titles = set()
 
-    # Kalıcı (repo içi) seen listesi
     repo_seen = load_repo_seen()
     repo_seen_changed = False
 
@@ -496,36 +530,33 @@ def run_once():
             cat_keywords = CATEGORIES.get(category, {}).get("keywords", [])
 
             for e in entries:
-                # Temel alanlar
                 raw_link = getattr(e, "link", "") or ""
                 norm_link = normalize_link(raw_link)
                 ts = entry_unix_ts(e)
                 title = getattr(e, "title", "(başlıksız)")
 
-                # Yaş filtresi
                 if is_too_old(e):
                     continue
 
-                # Makaleyi çek (kanonik + metin)
+                # Makale + canonical
                 base_text, canon = fetch_article(norm_link)
                 canon_link = normalize_link(canon) if canon else ""
                 primary_link = canon_link or norm_link
 
-                # Koşu içi link dedupe
+                pub = publisher_of(primary_link)
+                t_fp = title_fp(title)
+                run_title_key = f"{pub}::{t_fp}"
+
+                # DEDUPE SIRASI
                 if primary_link in run_seen_links or norm_link in run_seen_links:
                     continue
-                # DB link dedupe
                 if link_seen(conn, primary_link) or link_seen(conn, norm_link):
                     continue
-                # Kalıcı repo dedupe
                 if primary_link in repo_seen or norm_link in repo_seen:
                     continue
-
-                # Başlık parmak izi (yayıncı+temiz başlık) — koşu içi dedupe
-                pub = publisher_of(primary_link)
-                title_fp = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
-                run_title_key = f"{pub}::{title_fp}"
                 if run_title_key in run_seen_titles:
+                    continue
+                if title_seen(conn, pub, t_fp):
                     continue
 
                 # Keyword filtresi
@@ -536,12 +567,12 @@ def run_once():
                         if not entry_matches_keywords(title, plain_text, cat_keywords):
                             continue
 
-                # Deterministik ID (kanonik/normalize + zaman)
+                # Stabil ID (link + ts)
                 _id = f"{primary_link}|{ts or ''}"
                 if already_seen(conn, _id):
                     continue
 
-                # Özet + çeviri
+                # Özet + TR
                 summary_en = summarize_en(plain_text, SUMMARY_SENTENCES)
                 title_out  = translate_en_to_tr(title, is_title=True) if TRANSLATE_TITLES else title
                 text_tr    = translate_en_to_tr(summary_en, is_title=False) if TRANSLATE_SUMMARIES else summary_en
@@ -561,12 +592,13 @@ def run_once():
                     # DB işaretleri
                     mark_seen(conn, _id, title, primary_link, category)
                     mark_link_seen(conn, primary_link)
-                    mark_link_seen(conn, norm_link)
+                    if norm_link != primary_link:
+                        mark_link_seen(conn, norm_link)
+                    mark_title_seen(conn, pub, t_fp)
                     # Koşu içi işaretler
-                    run_seen_links.add(primary_link)
-                    run_seen_links.add(norm_link)
+                    run_seen_links.update({primary_link, norm_link})
                     run_seen_titles.add(run_title_key)
-                    # Kalıcı repo işareti
+                    # Repo kalıcı state
                     if primary_link not in repo_seen:
                         repo_seen.add(primary_link); repo_seen_changed = True
                     if norm_link and norm_link not in repo_seen:
@@ -579,23 +611,20 @@ def run_once():
 
         log(f"Gönderilen yeni özet: {sent_total}")
 
-        # Repo state dosyasını güncelle + push
         if repo_seen_changed:
             save_repo_seen(repo_seen)
             repo_commit_push_if_needed()
 
-        ping_healthcheck("")   # success
+        ping_healthcheck("")  # success
     except Exception as e:
         log(f"run_once beklenmeyen hata: {e}")
         ping_healthcheck("fail")
 
 def main():
     if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
-        run_once()
-        return
+        run_once(); return
     if INTERVAL_SECONDS <= 0:
-        run_once()
-        return
+        run_once(); return
     log(f"Başladı. Her {INTERVAL_SECONDS} sn’de bir kontrol edilecek.")
     while True:
         run_once()
