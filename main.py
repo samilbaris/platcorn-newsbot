@@ -1,20 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Platcorn NewsBot - main.py
-- RSS kaynaklarını tarar
-- İngilizce içerikleri özetler ve Türkçeye çevirir
-- Telegram'a başlık + özet + link gönderir (HTML)
-- Yinelenenleri engeller (link normalize + stabil SHA1 ID + run içi kopya filtresi)
+Platcorn NewsBot – tek dosya
+- Sadece anahtar kelime eşleşen haberleri yollar (başlık + özet/gövde araması).
+- Eski haberleri atlar (MAX_AGE_HOURS).
+- Tekrar göndermez (normalize_link + sqlite 'seen' + run_seen_links).
+- Başlık/özet Türkçeleştirme (GoogleTranslator) + özet (sumy LSA).
+- HTML güvenliği (escape) + Telegram HTML parse_mode.
+
+Gereken paketler: feedparser requests deep-translator sumy newspaper3k nltk
 """
 
-import os, re, time, sqlite3, hashlib
+import os, re, time, sqlite3, html
 from datetime import datetime
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import feedparser, requests
 from deep_translator import GoogleTranslator
 
-# Özetleme & NLTK
+# --- Özetleme & NLTK ---
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer
@@ -24,27 +27,43 @@ try:
 except LookupError:
     nltk.download("punkt")
 
-# Makale gövdesi
+# --- Makale gövdesi ---
 from newspaper import Article
 
-
 # =======================
-# AYARLAR
+# KULLANICI AYARLARI
 # =======================
-# Ortam değişkenlerinden al (GitHub Secrets / PythonAnywhere Env)
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 
-# Çalışma parametreleri
-INTERVAL_SECONDS     = 300      # 5 dk’da bir (lokalde/PA’de döngü; GHA'da tek tur)
-MAX_ITEMS_PER_FEED   = 5
+# Telegram bilgileri (öncelik env/secrets, yoksa sabitler)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or ""
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip() or ""
+
+# Lokal test ediyorsan buradan da verebilirsin:
+# TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN or "7766727211:XXXX..."
+# TELEGRAM_CHAT_ID   = TELEGRAM_CHAT_ID   or "8513010757"
+
+# Döngü ve içerik ayarları
+INTERVAL_SECONDS     = 300         # 5 dk
+MAX_ITEMS_PER_FEED   = 6
 SUMMARY_SENTENCES    = 4
 TRANSLATE_TITLES     = True
 TRANSLATE_SUMMARIES  = True
 
-# 🌍 Anahtar kelimeler (senin verdiğin set, aynen)
+# Filtreler
+STRICT_KEYWORDS      = True        # sadece keyword eşleşirse gönder
+SEARCH_IN_SUMMARY    = True        # başlığa ek olarak gövdede de ara
+MAX_AGE_HOURS        = 24          # bundan eski haber gönderilmez
+
+# App & DB
+APP_DIR = os.path.join(os.path.expanduser("~"), ".newsbot")
+DB_PATH = os.path.join(APP_DIR, "seen.db")
+
+# =======================
+# ANAHTAR KELİMELER
+# =======================
+
 GLOBAL_KEYWORDS = [
-    # 🧩 Platformlar & Ekosistem
+    # Platformlar & Ekosistem
     "youtube","twitch","kick","tiktok","instagram","x.com","threads","rumble",
     "livestream","stream","streamer","creator","influencer","content creator",
     "broadcast","subscriber","followers","viewers","shorts","clip","ban","partner",
@@ -52,28 +71,28 @@ GLOBAL_KEYWORDS = [
     "viral","trend","controversy","backlash","criticism","tepki","tepki çekti","linç",
     "drama","reaksiyon","yayın yasağı","trend oldu","viral oldu",
 
-    # 🌍 Ünlü yayıncılar & internet figürleri
+    # Ünlü yayıncılar & figürler
     "mrbeast","ishowspeed","hasanabi","asmongold","xqc","kai cenat",
     "ludwig","ninja","pokimane","amouranth","valkyrae","shroud","drdisrespect",
     "ice poseidon","adin ross","nickmercs","summit1g","tfue","sykkuno",
     "myth","pewdiepie","dream","tommyinnit","markiplier","jacksepticeye",
     "logan paul","ksi","jake paul","moistcr1tikal","charli d’amelio","bella poarch",
 
-    # 💬 Trendler & topluluk dinamikleri
+    # Trendler & topluluk dinamikleri
     "reaction","drama","controversy","leak","clip","highlight","rage quit",
     "cancelled","apology","comeback","announcement","collab","partnership",
     "reveal","exclusive","interview","livestream fail","viral clip","top moment",
     "trending","memes","internet reaction","eleştirildi","skandal","tartışma",
     "gündem oldu","sosyal medya tepki","yayıncı kavgası","clash","fued","debate",
 
-    # 💰 Creator economy & dijital iş dünyası
+    # Creator economy & iş
     "sponsorship","deal","brand","agency","marketing","ads","revenue",
     "creator economy","influencer marketing","merch","startup","partnership",
     "brand deal","promotion","sponsorluk","işbirliği","ajans","kampanya","kazan",
     "income","platform change","exclusive deal","collaboration","network",
     "marka anlaşması","kampanya","tanıtım videosu","sponsorlu içerik",
 
-    # 🇹🇷 Türkçe karşılıklar & yerel dijital kültür
+    # Türkçe & yerel dijital kültür
     "yayıncı","influencer","içerik üretici","dijital kültür","sosyal medya",
     "viral","akım","banlandı","yasaklandı","işbirliği","sponsor","ajans","anlaşma",
     "abonelik","yayın kazancı","platform değişikliği","trend oldu","komik video",
@@ -82,7 +101,7 @@ GLOBAL_KEYWORDS = [
     "tepki çekti","tepki gördü","eleştirildi","gündem oldu","linç yedi"
 ]
 
-# 🔤 Çeviri sırasında dokunulmaması gereken özel isimler
+# Çeviri sırasında korunacak özel isimler
 PROPER_NOUNS = [
     "YouTube", "Twitch", "Kick", "Rumble",
     "MrBeast", "iShowSpeed", "HasanAbi", "Asmongold", "xQc",
@@ -90,7 +109,7 @@ PROPER_NOUNS = [
     "Valkyrae", "Shroud", "Dr Disrespect", "Platcorn"
 ]
 
-# 🌍 Kaynak isim eşlemesi (görünür isimler)
+# Yayıncı adı eşlemeleri
 PUBLISHER_MAP = {
     "www.dexerto.com": "Dexerto",
     "www.theverge.com": "The Verge",
@@ -110,11 +129,11 @@ PUBLISHER_MAP = {
     "www.reddit.com": "Reddit / LivestreamFail",
 }
 
-# 🗞️ Tek kategori: Platcorn & Creator dünyası
+# Tek kategori (tüm anahtar kelimeler bu kategoriye)
 CATEGORIES = {
     "🟢 Platcorn & Creator": {
         "feeds": [
-            # — İngilizce yayıncı/creator haberleri —
+            # İngilizce kaynaklar
             "https://www.dexerto.com/feed",
             "https://www.dexerto.com/streaming/feed",
             "https://www.dexerto.com/entertainment/feed",
@@ -135,10 +154,10 @@ CATEGORIES = {
             "https://creatorhook.com/feed/",
             "https://passionfroot.me/blog/rss.xml",
 
-            # — Reddit (sadece haber tarzı içerik için) —
+            # Reddit (sadece LSF)
             "https://www.reddit.com/r/LivestreamFail/new/.rss",
 
-            # — Türkçe teknoloji ve eğlence kaynakları —
+            # Türkçe teknoloji & eğlence
             "https://onedio.com/rss",
             "https://www.webtekno.com/rss",
             "https://shiftdelete.net/feed",
@@ -146,7 +165,7 @@ CATEGORIES = {
             "https://www.log.com.tr/feed/",
             "https://www.donanimhaber.com/rss/tum/",
 
-            # — RSS.app üzerinden eklenen özel kaynaklar (X/IG & diğerleri) —
+            # RSS.app (X/IG & diğerleri)
             "https://rss.app/feeds/x6S2Zp6JUwCH1v0z.xml",
             "https://rss.app/feeds/U6QgNNMArHLnllsz.xml",
             "https://rss.app/feeds/ouzFl9q7fiqQ8kWC.xml",
@@ -154,20 +173,16 @@ CATEGORIES = {
             "https://rss.app/feeds/KutuqpKql1oBN51M.xml",
             "https://rss.app/feeds/uT33Zn9imAtSHeFb.xml",
             "https://rss.app/feeds/RQSjNahESu5puTnP.xml",
-            "https://rss.app/feeds/we2ENM1QjscyHS6V.xml"  # Sportskeeda Streamers
+            "https://rss.app/feeds/we2ENM1QjscyHS6V.xml"
         ],
-        "keywords": GLOBAL_KEYWORDS
+        "keywords": GLOBAL_KEYWORDS,
     }
 }
 
-# Kalıcı hafıza
-APP_DIR = os.path.join(os.path.expanduser("~"), ".newsbot")
-DB_PATH  = os.path.join(APP_DIR, "seen.db")
-
-
 # =======================
-# ARAÇLAR / YARDIMCILAR
+# ARAÇLAR
 # =======================
+
 def log(msg: str):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
@@ -189,6 +204,9 @@ def init_db():
     conn.commit()
     return conn
 
+def escape_html(s: str) -> str:
+    return html.escape(s or "", quote=False)
+
 def host_of(url: str) -> str:
     try:
         return urlparse(url).netloc
@@ -199,15 +217,38 @@ def publisher_of(url: str) -> str:
     host = host_of(url).lower()
     return PUBLISHER_MAP.get(host, host)
 
-def escape_html(s: str) -> str:
-    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+def normalize_link(url: str) -> str:
+    """URL'yi normalize et: http→https, query parametrelerini sırala, fragment'i at."""
+    if not url:
+        return url
+    try:
+        p = urlparse(url.strip())
+        scheme = "https" if p.scheme in ("http", "https") else p.scheme
+        q = urlencode(sorted(parse_qsl(p.query, keep_blank_values=True)))
+        return urlunparse((scheme, p.netloc.lower(), p.path, "", q, ""))  # fragment boş
+    except Exception:
+        return url
 
-# Çeviri öncesi/sonrası düzenleyiciler
+def make_item_id(entry) -> str:
+    """RSS entry için deterministik ID (link + published/updated varsa)."""
+    link = normalize_link(getattr(entry, "link", "") or "")
+    base = getattr(entry, "id", "") or link or getattr(entry, "title", "")
+    ts = None
+    for attr in ("published_parsed", "updated_parsed"):
+        t = getattr(entry, attr, None)
+        if t:
+            try:
+                ts = int(time.mktime(t))
+                break
+            except Exception:
+                pass
+    return f"{base}|{ts or ''}"
+
 def pretranslate_en(s: str) -> str:
     if not s: return s
-    s = re.sub(r"\$?(\d+(?:\.\d+)?)\s?B\b", r"\1 billion", s, flags=re.IGNORECASE)
-    s = re.sub(r"\$?(\d+(?:\.\d+)?)\s?M\b", r"\1 million", s, flags=re.IGNORECASE)
-    s = re.sub(r"\$?(\d+(?:\.\d+)?)\s?K\b", r"\1 thousand", s, flags=re.IGNORECASE)
+    s = re.sub(r"\$?(\d+(\.\d+)?)\s?B\b", r"\1 billion", s, flags=re.IGNORECASE)
+    s = re.sub(r"\$?(\d+(\.\d+)?)\s?M\b", r"\1 million", s, flags=re.IGNORECASE)
+    s = re.sub(r"\$?(\d+(\.\d+)?)\s?K\b", r"\1 thousand", s, flags=re.IGNORECASE)
     s = s.replace("’","'").replace("“","\"").replace("”","\"")
     return s
 
@@ -241,24 +282,19 @@ def polish_title_tr(tr: str) -> str:
 
 def translate_en_to_tr(text: str, is_title=False) -> str:
     if not text: return text
-    # Özel isimleri koru
     placeholders = {}
     safe = text
     for i, name in enumerate(sorted(PROPER_NOUNS, key=len, reverse=True)):
         key = f"__PN{i}__"
         placeholders[key] = name
         safe = re.sub(rf"\b{name}\b", key, safe, flags=re.IGNORECASE)
-
     safe = pretranslate_en(safe)
-
     try:
         tr = GoogleTranslator(source="en", target="tr").translate(safe)
     except Exception:
         tr = safe
-
     for key, name in placeholders.items():
         tr = tr.replace(key, name)
-
     tr = postprocess_money_tr(tr)
     if is_title:
         tr = polish_title_tr(tr)
@@ -285,7 +321,6 @@ def summarize_en(text: str, n_sent: int) -> str:
         return text
 
 def bullets_tr(paragraph: str) -> str:
-    """Uzun paragrafı 3-5 maddeye böl (TR okunaklılık)."""
     if not paragraph: return paragraph
     sents = re.split(r"(?<=[.!?])\s+", paragraph)
     sents = [s.strip() for s in sents if s.strip()]
@@ -295,45 +330,24 @@ def bullets_tr(paragraph: str) -> str:
     return "• " + "\n• ".join(sents)
 
 def tg_send(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram ENV eksik: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
+        return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={
+        payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
             "parse_mode": "HTML",
-            "disable_web_page_preview": False
-        }, timeout=30).raise_for_status()
+            "disable_web_page_preview": False,
+        }
+        r = requests.post(url, json=payload, timeout=30)
+        r.raise_for_status()
     except Exception as e:
         log(f"Telegram gönderim hatası: {e}")
 
-# --- Link normalize + stabil ID üretimi (yinelenmeyi engeller)
-TRACKING_PARAMS = {
-    "utm_source","utm_medium","utm_campaign","utm_term","utm_content",
-    "si","fbclid","gclid","ref","igshid","mc_cid","mc_eid"
-}
-
-def normalize_link(url: str) -> str:
-    try:
-        u = urlparse(url)
-        q = [(k, v) for (k, v) in parse_qsl(u.query, keep_blank_values=True)
-             if k.lower() not in TRACKING_PARAMS]
-        clean = urlunparse((
-            u.scheme or "https",
-            (u.netloc or "").lower(),
-            u.path.rstrip("/"),
-            "", urlencode(q, doseq=True), ""
-        ))
-        return clean
-    except Exception:
-        return url or ""
-
-def make_item_id(entry) -> str:
-    """RSS öğesi için stabil ID: id -> temiz link -> başlık; sonra SHA1."""
-    eid   = getattr(entry, "id", "") or ""
-    link  = normalize_link(getattr(entry, "link", "") or "")
-    title = getattr(entry, "title", "") or ""
-    base  = eid or link or title
-    return hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()
+def norm_id(entry) -> str:
+    return getattr(entry, "id", None) or getattr(entry, "link", None) or getattr(entry, "title", "")
 
 def already_seen(conn, _id: str) -> bool:
     cur = conn.execute("SELECT 1 FROM seen WHERE id=?", (_id,))
@@ -346,11 +360,36 @@ def mark_seen(conn, _id: str, title: str, link: str, category: str):
     )
     conn.commit()
 
-def match_keywords(title: str, kw_list) -> bool:
+# ----- Keyword & yaş kontrol yardımcıları -----
+
+def entry_unix_ts(e):
+    for attr in ("published_parsed", "updated_parsed"):
+        t = getattr(e, attr, None)
+        if t:
+            try:
+                return int(time.mktime(t))
+            except Exception:
+                pass
+    return None
+
+def is_too_old(e) -> bool:
+    ts = entry_unix_ts(e)
+    if not ts:
+        return True   # tarihi olmayanları flood olmasın diye atla (istersen False yap)
+    return (time.time() - ts) > MAX_AGE_HOURS * 3600
+
+def text_matches_keywords(text: str, kw_list) -> bool:
+    t = (text or "").lower()
+    return any(k.lower() in t for k in (kw_list or []))
+
+def entry_matches_keywords(title: str, body: str, kw_list) -> bool:
     if not kw_list:
         return True
-    t = (title or "").lower()
-    return any(k.lower() in t for k in kw_list)
+    if text_matches_keywords(title, kw_list):
+        return True
+    if SEARCH_IN_SUMMARY and text_matches_keywords(body, kw_list):
+        return True
+    return False
 
 def build_feed_catalog():
     catalog = {}
@@ -359,15 +398,15 @@ def build_feed_catalog():
             catalog[f] = cat
     return catalog
 
+# =======================
+# ÇALIŞTIRMA
+# =======================
 
-# =======================
-# ANA İŞ
-# =======================
 def run_once():
     conn = init_db()
     catalog = build_feed_catalog()
     sent_total = 0
-    run_seen_links = set()   # aynı çalıştırmada, farklı feed’den gelse bile tek gönder
+    run_seen_links = set()  # aynı çalıştırmada farklı feed’den gelse de tek sefer
 
     for feed_url, category in catalog.items():
         try:
@@ -384,31 +423,37 @@ def run_once():
             link  = normalize_link(getattr(e, "link", "") or "")
             title = getattr(e, "title", "(başlıksız)")
 
+            # tekrar engelle
             if already_seen(conn, _id):
                 continue
             if link in run_seen_links:
                 mark_seen(conn, _id, title, link, category)
                 continue
 
-            # keyword filtresi
-            if not (match_keywords(title, GLOBAL_KEYWORDS) or match_keywords(title, cat_keywords)):
+            # yaş filtresi
+            if is_too_old(e):
                 mark_seen(conn, _id, title, link, category)
                 continue
 
-            # Metin kaynağı: makale gövdesi > summary > description
+            # metni erkenden çıkar (keyword kontrolü için)
             base_text = fetch_article_text(link) or getattr(e, "summary", "") or getattr(e, "description", "")
-            # RSS summary içi HTML temizliği
             base_text = re.sub(r"<[^>]+>", " ", base_text or "")
             base_text = re.sub(r"\s+", " ", base_text).strip()
 
-            # Özet + çeviri
-            summary_en = summarize_en(base_text, SUMMARY_SENTENCES)
+            # keyword filtresi
+            if STRICT_KEYWORDS:
+                if not entry_matches_keywords(title, base_text, GLOBAL_KEYWORDS):
+                    if not entry_matches_keywords(title, base_text, cat_keywords):
+                        mark_seen(conn, _id, title, link, category)
+                        continue
 
+            # özet + çeviri
+            summary_en = summarize_en(base_text, SUMMARY_SENTENCES)
             title_out  = translate_en_to_tr(title, is_title=True) if TRANSLATE_TITLES else title
             text_tr    = translate_en_to_tr(summary_en, is_title=False) if TRANSLATE_SUMMARIES else summary_en
             text_final = bullets_tr(text_tr)
 
-            # HTML kaçışları (Telegram parse_mode=HTML)
+            # HTML güvenliği
             title_out  = escape_html(title_out)
             text_final = escape_html(text_final)
 
@@ -420,21 +465,23 @@ def run_once():
                 mark_seen(conn, _id, title, link, category)
                 run_seen_links.add(link)
                 sent_total += 1
-                time.sleep(0.8)  # Telegram rate limit'e saygı
+                time.sleep(0.8)
             except Exception as ex:
                 log(f"Gönderim hatası: {title} -> {ex}")
 
     log(f"Gönderilen yeni özet: {sent_total}")
 
 def main():
-    # GitHub Actions içinde tek tur çalış
+    # GitHub Actions'ta tek tur
     if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
         run_once()
         return
-    # Yerel/PA’de döngü
+
+    # Yerel/PA döngü
     if INTERVAL_SECONDS <= 0:
         run_once()
         return
+
     log(f"Başladı. Her {INTERVAL_SECONDS} sn’de bir kontrol edilecek.")
     while True:
         run_once()
