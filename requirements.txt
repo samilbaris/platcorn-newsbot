@@ -1,6 +1,7 @@
 feedparser
 requests
 beautifulsoup4
-python-telegram-bot
 nltk
+python-telegram-bot==20.3
+deep-translator
 html2text
