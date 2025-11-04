@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Platcorn NewsBot – tek dosya (anti-duplicate hardened)
+Platcorn NewsBot – tek dosya (anti-duplicate hardened + persistent seen)
 - Sadece anahtar kelime eşleşen haberleri yollar (başlık + opsiyonel gövde araması).
 - Eski haberleri atlar (MAX_AGE_HOURS).
-- Tekrar göndermez: canonical URL + normalize_link + sqlite 'seen' + 'seen_link' + run_seen_sets.
+- Tekrar göndermez: canonical URL + normalize_link + sqlite 'seen' + 'seen_link'
+  + run_seen_sets + PERSISTENT REPO seen (data/seen_urls.txt + git commit/push).
 - Başlık/özet Türkçeleştirme (GoogleTranslator) + özet (sumy LSA).
 - HTML güvenliği (escape) + Telegram HTML parse_mode.
 - healthchecks.io pingi Python’dan atar (/start, /fail, başarı).
 """
 
-import os, re, time, sqlite3, html
+import os, re, time, sqlite3, html, subprocess
+from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
@@ -179,7 +181,6 @@ def init_db():
             ts   INTEGER
         )
     """)
-    # link tabanlı dedupe (kanonik veya normalize link)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS seen_link (
             link TEXT PRIMARY KEY,
@@ -229,7 +230,7 @@ def is_too_old(e) -> bool:
         return True
     return (time.time() - ts) > MAX_AGE_HOURS * 3600
 
-# --- Kanonik link & metin çek ---
+# --- Makale çek ---
 def fetch_article(url: str):
     """Return (text, canonical_link)"""
     try:
@@ -241,7 +242,7 @@ def fetch_article(url: str):
     except Exception:
         return "", ""
 
-# --- Dedupe yardımcıları ---
+# --- DB dedupe ---
 def link_seen(conn, link: str) -> bool:
     cur = conn.execute("SELECT 1 FROM seen_link WHERE link=?", (link,))
     return cur.fetchone() is not None
@@ -263,6 +264,7 @@ def mark_seen(conn, _id: str, title: str, link: str, category: str):
     )
     conn.commit()
 
+# --- Çeviri/özet ---
 def pretranslate_en(s: str) -> str:
     if not s: return s
     s = re.sub(r"\$?(\d+(\.\d+)?)\s?B\b", r"\1 billion", s, flags=re.IGNORECASE)
@@ -412,6 +414,59 @@ def ping_healthcheck(suffix: str = ""):
     except Exception as e:
         log(f"healthcheck ping başarısız ({suffix}): {e}")
 
+# -----------------------
+# Kalıcı seen (repo içinde)
+# -----------------------
+
+def repo_state_path() -> Path:
+    """Repo içindeki kalıcı state dosyasının yolu (data/seen_urls.txt)."""
+    workspace = os.getenv("GITHUB_WORKSPACE", "") or os.getcwd()
+    p = Path(workspace) / "data" / "seen_urls.txt"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+def load_repo_seen() -> set:
+    try:
+        p = repo_state_path()
+        if not p.exists():
+            return set()
+        return set(x.strip() for x in p.read_text(encoding="utf-8").splitlines() if x.strip())
+    except Exception:
+        return set()
+
+def save_repo_seen(seen: set):
+    p = repo_state_path()
+    p.write_text("\n".join(sorted(seen)) + "\n", encoding="utf-8")
+
+def repo_commit_push_if_needed():
+    """
+    GHA ortamında data/seen_urls.txt değiştiyse commit + push.
+    PAT_TOKEN varsa onu kullanır; yoksa GITHUB_TOKEN ile dener.
+    """
+    if os.getenv("GITHUB_ACTIONS", "").lower() != "true":
+        return
+
+    repo = os.getenv("GITHUB_REPOSITORY")
+    branch = os.getenv("GITHUB_REF_NAME", "main")
+    workspace = os.getenv("GITHUB_WORKSPACE", "") or os.getcwd()
+    pat = os.getenv("PAT_TOKEN") or os.getenv("GITHUB_TOKEN")
+
+    if not repo or not pat:
+        return
+
+    def run(cmd, cwd=None):
+        subprocess.run(cmd, cwd=cwd, shell=True, check=False,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    run('git config user.name "platcorn-bot"')
+    run('git config user.email "bot@users.noreply.github.com"')
+
+    run('git add data/seen_urls.txt', cwd=workspace)
+    run('git commit -m "chore(bot): update seen urls [skip ci]" || true', cwd=workspace)
+
+    remote_url = f"https://{pat}@github.com/{repo}.git"
+    run(f'git push "{remote_url}" HEAD:{branch}', cwd=workspace)
+
 # =======================
 # ÇALIŞTIRMA
 # =======================
@@ -424,6 +479,10 @@ def run_once():
     sent_total = 0
     run_seen_links  = set()
     run_seen_titles = set()
+
+    # Kalıcı (repo içi) seen listesi
+    repo_seen = load_repo_seen()
+    repo_seen_changed = False
 
     try:
         for feed_url, category in catalog.items():
@@ -457,6 +516,9 @@ def run_once():
                     continue
                 # DB link dedupe
                 if link_seen(conn, primary_link) or link_seen(conn, norm_link):
+                    continue
+                # Kalıcı repo dedupe
+                if primary_link in repo_seen or norm_link in repo_seen:
                     continue
 
                 # Başlık parmak izi (yayıncı+temiz başlık) — koşu içi dedupe
@@ -504,12 +566,24 @@ def run_once():
                     run_seen_links.add(primary_link)
                     run_seen_links.add(norm_link)
                     run_seen_titles.add(run_title_key)
+                    # Kalıcı repo işareti
+                    if primary_link not in repo_seen:
+                        repo_seen.add(primary_link); repo_seen_changed = True
+                    if norm_link and norm_link not in repo_seen:
+                        repo_seen.add(norm_link); repo_seen_changed = True
+
                     sent_total += 1
                     time.sleep(0.8)
                 except Exception as ex:
                     log(f"Gönderim hatası: {title} -> {ex}")
 
         log(f"Gönderilen yeni özet: {sent_total}")
+
+        # Repo state dosyasını güncelle + push
+        if repo_seen_changed:
+            save_repo_seen(repo_seen)
+            repo_commit_push_if_needed()
+
         ping_healthcheck("")   # success
     except Exception as e:
         log(f"run_once beklenmeyen hata: {e}")
