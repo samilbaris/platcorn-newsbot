@@ -6,6 +6,7 @@ Platcorn NewsBot – tek dosya
 - Tekrar göndermez (normalize_link + sqlite 'seen' + run_seen_links).
 - Başlık/özet Türkçeleştirme (GoogleTranslator) + özet (sumy LSA).
 - HTML güvenliği (escape) + Telegram HTML parse_mode.
+- healthchecks.io pingi Python’dan atar (/start, /fail, başarı).
 
 Gereken paketler: feedparser requests deep-translator sumy newspaper3k nltk
 """
@@ -38,10 +39,6 @@ from newspaper import Article
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or ""
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip() or ""
 
-# Lokal test ediyorsan buradan da verebilirsin:
-# TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN or "7766727211:XXXX..."
-# TELEGRAM_CHAT_ID   = TELEGRAM_CHAT_ID   or "8513010757"
-
 # Döngü ve içerik ayarları
 INTERVAL_SECONDS     = 300         # 5 dk
 MAX_ITEMS_PER_FEED   = 6
@@ -50,9 +47,9 @@ TRANSLATE_TITLES     = True
 TRANSLATE_SUMMARIES  = True
 
 # Filtreler
-STRICT_KEYWORDS      = True        # sadece keyword eşleşirse gönder
-SEARCH_IN_SUMMARY    = True        # başlığa ek olarak gövdede de ara
-MAX_AGE_HOURS        = 24          # bundan eski haber gönderilmez
+STRICT_KEYWORDS   = True       # sadece filtreye uyanlar
+SEARCH_IN_SUMMARY = False      # özet/gövde araması (gürültü için kapalı)
+MAX_AGE_HOURS     = 24
 
 # App & DB
 APP_DIR = os.path.join(os.path.expanduser("~"), ".newsbot")
@@ -99,6 +96,15 @@ GLOBAL_KEYWORDS = [
     "reaksiyon","twitch draması","kick yayını","youtube videosu","sızdırıldı",
     "takipçi","izlenme","tıklanma","algoritma","viral oldu","yayın yasağı",
     "tepki çekti","tepki gördü","eleştirildi","gündem oldu","linç yedi"
+]
+
+# Başlıkta mutlaka geçmesi gereken "çekirdek" anahtarlar (biri yeter)
+CORE_KEYWORDS = [
+    "youtube","twitch","kick","tiktok","instagram","x","threads","rumble",
+    "livestream","streamer","stream",
+    "mrbeast","ishowspeed","hasanabi","asmongold","xqc","kai cenat","ludwig",
+    "ninja","pokimane","amouranth","valkyrae","shroud","drdisrespect",
+    "pewdiepie","adin ross","nickmercs","tfue","sykkuno","markiplier",
 ]
 
 # Çeviri sırasında korunacak özel isimler
@@ -346,9 +352,6 @@ def tg_send(text: str):
     except Exception as e:
         log(f"Telegram gönderim hatası: {e}")
 
-def norm_id(entry) -> str:
-    return getattr(entry, "id", None) or getattr(entry, "link", None) or getattr(entry, "title", "")
-
 def already_seen(conn, _id: str) -> bool:
     cur = conn.execute("SELECT 1 FROM seen WHERE id=?", (_id,))
     return cur.fetchone() is not None
@@ -375,21 +378,43 @@ def entry_unix_ts(e):
 def is_too_old(e) -> bool:
     ts = entry_unix_ts(e)
     if not ts:
-        return True   # tarihi olmayanları flood olmasın diye atla (istersen False yap)
+        return True   # tarihi olmayanları flood olmasın diye atla
     return (time.time() - ts) > MAX_AGE_HOURS * 3600
 
-def text_matches_keywords(text: str, kw_list) -> bool:
-    t = (text or "").lower()
-    return any(k.lower() in t for k in (kw_list or []))
+def text_matches_keywords_whole_words(text: str, keywords) -> bool:
+    """Kelimeleri tam eşle (word boundary), küçük/büyük duyarsız."""
+    if not text or not keywords:
+        return False
+    t = text.lower()
+    for kw in keywords:
+        kw = kw.lower().strip()
+        if not kw:
+            continue
+        pat = r"\b" + re.escape(kw) + r"\b"
+        if re.search(pat, t, flags=re.IGNORECASE):
+            return True
+    return False
 
 def entry_matches_keywords(title: str, body: str, kw_list) -> bool:
-    if not kw_list:
-        return True
-    if text_matches_keywords(title, kw_list):
-        return True
-    if SEARCH_IN_SUMMARY and text_matches_keywords(body, kw_list):
-        return True
-    return False
+    """
+    Kural:
+      1) Başlık ÇEKİRDEK listeden en az bir 'tam kelime' içermeli
+      2) (opsiyonel) GLOBAL_KEYWORDS ile genişleme – başlık ya da gövde
+    """
+    t = (title or "")
+    # 1) çekirdek şartı (sadece başlıkta)
+    if not text_matches_keywords_whole_words(t, CORE_KEYWORDS):
+        return False
+
+    # 2) geniş liste – başlıkta tam kelime arayalım (gövdeyi istersen aç)
+    if kw_list:
+        if text_matches_keywords_whole_words(t, kw_list):
+            return True
+        if SEARCH_IN_SUMMARY and text_matches_keywords_whole_words(body or "", kw_list):
+            return True
+        return False
+
+    return True
 
 def build_feed_catalog():
     catalog = {}
@@ -398,78 +423,110 @@ def build_feed_catalog():
             catalog[f] = cat
     return catalog
 
+# -----------------------
+# healthchecks.io ping
+# -----------------------
+
+def hc_url(suffix: str = "") -> str:
+    base = (os.getenv("HEALTHCHECK_URL") or "").strip()
+    if not base:
+        return ""
+    # trailing slash'ı yönet, suffix opsiyonel
+    if suffix and not suffix.startswith("/"):
+        suffix = "/" + suffix
+    return base.rstrip("/") + suffix
+
+def ping_healthcheck(suffix: str = ""):
+    url = hc_url(suffix)
+    if not url:
+        return
+    try:
+        requests.get(url, timeout=10)
+    except Exception as e:
+        log(f"healthcheck ping başarısız ({suffix}): {e}")
+
 # =======================
 # ÇALIŞTIRMA
 # =======================
 
 def run_once():
+    # İş başlangıcı ping
+    ping_healthcheck("start")
+
     conn = init_db()
     catalog = build_feed_catalog()
     sent_total = 0
     run_seen_links = set()  # aynı çalıştırmada farklı feed’den gelse de tek sefer
 
-    for feed_url, category in catalog.items():
-        try:
-            d = feedparser.parse(feed_url)
-            entries = d.entries[:MAX_ITEMS_PER_FEED]
-        except Exception as e:
-            log(f"Feed hatası: {feed_url} -> {e}")
-            continue
-
-        cat_keywords = CATEGORIES.get(category, {}).get("keywords", [])
-
-        for e in entries:
-            _id   = make_item_id(e)
-            link  = normalize_link(getattr(e, "link", "") or "")
-            title = getattr(e, "title", "(başlıksız)")
-
-            # tekrar engelle
-            if already_seen(conn, _id):
-                continue
-            if link in run_seen_links:
-                mark_seen(conn, _id, title, link, category)
-                continue
-
-            # yaş filtresi
-            if is_too_old(e):
-                mark_seen(conn, _id, title, link, category)
-                continue
-
-            # metni erkenden çıkar (keyword kontrolü için)
-            base_text = fetch_article_text(link) or getattr(e, "summary", "") or getattr(e, "description", "")
-            base_text = re.sub(r"<[^>]+>", " ", base_text or "")
-            base_text = re.sub(r"\s+", " ", base_text).strip()
-
-            # keyword filtresi
-            if STRICT_KEYWORDS:
-                if not entry_matches_keywords(title, base_text, GLOBAL_KEYWORDS):
-                    if not entry_matches_keywords(title, base_text, cat_keywords):
-                        mark_seen(conn, _id, title, link, category)
-                        continue
-
-            # özet + çeviri
-            summary_en = summarize_en(base_text, SUMMARY_SENTENCES)
-            title_out  = translate_en_to_tr(title, is_title=True) if TRANSLATE_TITLES else title
-            text_tr    = translate_en_to_tr(summary_en, is_title=False) if TRANSLATE_SUMMARIES else summary_en
-            text_final = bullets_tr(text_tr)
-
-            # HTML güvenliği
-            title_out  = escape_html(title_out)
-            text_final = escape_html(text_final)
-
-            pub = publisher_of(link)
-            msg = f"🟢 Platcorn & Creator\n<b>{title_out}</b>\nKaynak: {pub} ({host_of(link)})\n\n{text_final}\n\n🔗 {link}"
-
+    try:
+        for feed_url, category in catalog.items():
             try:
-                tg_send(msg)
-                mark_seen(conn, _id, title, link, category)
-                run_seen_links.add(link)
-                sent_total += 1
-                time.sleep(0.8)
-            except Exception as ex:
-                log(f"Gönderim hatası: {title} -> {ex}")
+                d = feedparser.parse(feed_url)
+                entries = d.entries[:MAX_ITEMS_PER_FEED]
+            except Exception as e:
+                log(f"Feed hatası: {feed_url} -> {e}")
+                continue
 
-    log(f"Gönderilen yeni özet: {sent_total}")
+            cat_keywords = CATEGORIES.get(category, {}).get("keywords", [])
+
+            for e in entries:
+                _id   = make_item_id(e)
+                link  = normalize_link(getattr(e, "link", "") or "")
+                title = getattr(e, "title", "(başlıksız)")
+
+                # tekrar engelle
+                if already_seen(conn, _id):
+                    continue
+                if link in run_seen_links:
+                    mark_seen(conn, _id, title, link, category)
+                    continue
+
+                # yaş filtresi
+                if is_too_old(e):
+                    mark_seen(conn, _id, title, link, category)
+                    continue
+
+                # metni erkenden çıkar (keyword kontrolü için)
+                base_text = fetch_article_text(link) or getattr(e, "summary", "") or getattr(e, "description", "")
+                base_text = re.sub(r"<[^>]+>", " ", base_text or "")
+                base_text = re.sub(r"\s+", " ", base_text).strip()
+
+                # keyword filtresi
+                if STRICT_KEYWORDS:
+                    if not entry_matches_keywords(title, base_text, GLOBAL_KEYWORDS):
+                        if not entry_matches_keywords(title, base_text, cat_keywords):
+                            mark_seen(conn, _id, title, link, category)
+                            continue
+
+                # özet + çeviri
+                summary_en = summarize_en(base_text, SUMMARY_SENTENCES)
+                title_out  = translate_en_to_tr(title, is_title=True) if TRANSLATE_TITLES else title
+                text_tr    = translate_en_to_tr(summary_en, is_title=False) if TRANSLATE_SUMMARIES else summary_en
+                text_final = bullets_tr(text_tr)
+
+                # HTML güvenliği
+                title_out  = escape_html(title_out)
+                text_final = escape_html(text_final)
+
+                pub = publisher_of(link)
+                msg = f"🟢 Platcorn & Creator\n<b>{title_out}</b>\nKaynak: {pub} ({host_of(link)})\n\n{text_final}\n\n🔗 {link}"
+
+                try:
+                    tg_send(msg)
+                    mark_seen(conn, _id, title, link, category)
+                    run_seen_links.add(link)
+                    sent_total += 1
+                    time.sleep(0.8)
+                except Exception as ex:
+                    log(f"Gönderim hatası: {title} -> {ex}")
+
+        log(f"Gönderilen yeni özet: {sent_total}")
+        # Başarı ping
+        ping_healthcheck("")
+    except Exception as e:
+        # Fail ping ve log
+        log(f"run_once beklenmeyen hata: {e}")
+        ping_healthcheck("fail")
 
 def main():
     # GitHub Actions'ta tek tur
