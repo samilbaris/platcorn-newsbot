@@ -6,3 +6,5 @@ deep-translator
 nltk
 sumy
 newspaper3k
+lxml>=5.0.0
+lxml_html_clean
