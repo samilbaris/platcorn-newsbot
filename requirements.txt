@@ -5,3 +5,4 @@ python-telegram-bot==20.3
 deep-translator
 nltk
 sumy
+newspaper3k
