@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
-import os, re, time, sqlite3, sys, hashlib
+"""
+Platcorn NewsBot - main.py
+- RSS kaynaklarını tarar
+- İngilizce içerikleri özetler ve Türkçeye çevirir
+- Telegram'a başlık + özet + link gönderir (HTML)
+- Yinelenenleri engeller (link normalize + stabil SHA1 ID + run içi kopya filtresi)
+"""
+
+import os, re, time, sqlite3, hashlib
 from datetime import datetime
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
@@ -19,20 +27,22 @@ except LookupError:
 # Makale gövdesi
 from newspaper import Article
 
+
 # =======================
 # AYARLAR
 # =======================
-# Ortam değişkeni > sabit: GitHub Actions / PythonAnywhere ile güvenli
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7766727211:AAHl8BnCzQey74LKZb4mw6bFqqR5jZYqw-U")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",  "8513010757")
+# Ortam değişkenlerinden al (GitHub Secrets / PythonAnywhere Env)
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 
-INTERVAL_SECONDS     = 300      # 5 dk’da bir kontrol (lokalde/PA’de döngü)
+# Çalışma parametreleri
+INTERVAL_SECONDS     = 300      # 5 dk’da bir (lokalde/PA’de döngü; GHA'da tek tur)
 MAX_ITEMS_PER_FEED   = 5
 SUMMARY_SENTENCES    = 4
 TRANSLATE_TITLES     = True
 TRANSLATE_SUMMARIES  = True
 
-# 🌍 Tüm anahtar kelimeler (TR + EN)
+# 🌍 Anahtar kelimeler (senin verdiğin set, aynen)
 GLOBAL_KEYWORDS = [
     # 🧩 Platformlar & Ekosistem
     "youtube","twitch","kick","tiktok","instagram","x.com","threads","rumble",
@@ -150,11 +160,13 @@ CATEGORIES = {
     }
 }
 
+# Kalıcı hafıza
 APP_DIR = os.path.join(os.path.expanduser("~"), ".newsbot")
 DB_PATH  = os.path.join(APP_DIR, "seen.db")
 
+
 # =======================
-# ARAÇLAR
+# ARAÇLAR / YARDIMCILAR
 # =======================
 def log(msg: str):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -177,21 +189,25 @@ def init_db():
     conn.commit()
     return conn
 
-def host_of(url):
+def host_of(url: str) -> str:
     try:
         return urlparse(url).netloc
-    except:
+    except Exception:
         return ""
 
-def publisher_of(url):
+def publisher_of(url: str) -> str:
     host = host_of(url).lower()
     return PUBLISHER_MAP.get(host, host)
 
+def escape_html(s: str) -> str:
+    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+# Çeviri öncesi/sonrası düzenleyiciler
 def pretranslate_en(s: str) -> str:
     if not s: return s
-    s = re.sub(r"\$?(\d+(\.\d+)?)\s?B\b", r"\1 billion", s, flags=re.IGNORECASE)
-    s = re.sub(r"\$?(\d+(\.\d+)?)\s?M\b", r"\1 million", s, flags=re.IGNORECASE)
-    s = re.sub(r"\$?(\d+(\.\d+)?)\s?K\b", r"\1 thousand", s, flags=re.IGNORECASE)
+    s = re.sub(r"\$?(\d+(?:\.\d+)?)\s?B\b", r"\1 billion", s, flags=re.IGNORECASE)
+    s = re.sub(r"\$?(\d+(?:\.\d+)?)\s?M\b", r"\1 million", s, flags=re.IGNORECASE)
+    s = re.sub(r"\$?(\d+(?:\.\d+)?)\s?K\b", r"\1 thousand", s, flags=re.IGNORECASE)
     s = s.replace("’","'").replace("“","\"").replace("”","\"")
     return s
 
@@ -225,7 +241,7 @@ def polish_title_tr(tr: str) -> str:
 
 def translate_en_to_tr(text: str, is_title=False) -> str:
     if not text: return text
-    # Özel isimleri yer tutucuya al
+    # Özel isimleri koru
     placeholders = {}
     safe = text
     for i, name in enumerate(sorted(PROPER_NOUNS, key=len, reverse=True)):
@@ -269,7 +285,7 @@ def summarize_en(text: str, n_sent: int) -> str:
         return text
 
 def bullets_tr(paragraph: str) -> str:
-    """Uzun paragrafı 3-5 maddeye bölmeye çalış (TR çıktıyı daha okunur yapar)."""
+    """Uzun paragrafı 3-5 maddeye böl (TR okunaklılık)."""
     if not paragraph: return paragraph
     sents = re.split(r"(?<=[.!?])\s+", paragraph)
     sents = [s.strip() for s in sents if s.strip()]
@@ -290,27 +306,29 @@ def tg_send(text: str):
     except Exception as e:
         log(f"Telegram gönderim hatası: {e}")
 
-# --- Tekrarlı gönderimi engellemek için link normalize & stabil ID üretimi
-TRACKING_PARAMS = {"utm_source","utm_medium","utm_campaign","utm_term","utm_content",
-                   "si","fbclid","gclid","ref","igshid","mc_cid","mc_eid"}
+# --- Link normalize + stabil ID üretimi (yinelenmeyi engeller)
+TRACKING_PARAMS = {
+    "utm_source","utm_medium","utm_campaign","utm_term","utm_content",
+    "si","fbclid","gclid","ref","igshid","mc_cid","mc_eid"
+}
 
 def normalize_link(url: str) -> str:
     try:
         u = urlparse(url)
-        q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True)
+        q = [(k, v) for (k, v) in parse_qsl(u.query, keep_blank_values=True)
              if k.lower() not in TRACKING_PARAMS]
         clean = urlunparse((
             u.scheme or "https",
             (u.netloc or "").lower(),
             u.path.rstrip("/"),
-            "", urlencode(q, doseq=True), ""   # temiz query
+            "", urlencode(q, doseq=True), ""
         ))
         return clean
     except Exception:
         return url or ""
 
 def make_item_id(entry) -> str:
-    """RSS öğesi için stabil bir ID: id -> temiz link -> başlık; sonra SHA1."""
+    """RSS öğesi için stabil ID: id -> temiz link -> başlık; sonra SHA1."""
     eid   = getattr(entry, "id", "") or ""
     link  = normalize_link(getattr(entry, "link", "") or "")
     title = getattr(entry, "title", "") or ""
@@ -341,6 +359,7 @@ def build_feed_catalog():
             catalog[f] = cat
     return catalog
 
+
 # =======================
 # ANA İŞ
 # =======================
@@ -348,7 +367,7 @@ def run_once():
     conn = init_db()
     catalog = build_feed_catalog()
     sent_total = 0
-    run_seen_links = set()   # aynı çalıştırmada farklı feed’lerden gelen kopyaları engelle
+    run_seen_links = set()   # aynı çalıştırmada, farklı feed’den gelse bile tek gönder
 
     for feed_url, category in catalog.items():
         try:
@@ -371,42 +390,48 @@ def run_once():
                 mark_seen(conn, _id, title, link, category)
                 continue
 
+            # keyword filtresi
             if not (match_keywords(title, GLOBAL_KEYWORDS) or match_keywords(title, cat_keywords)):
                 mark_seen(conn, _id, title, link, category)
                 continue
 
-            # Makale metni -> özet -> TR
-            base_text  = fetch_article_text(link) or getattr(e, "summary", "") or getattr(e, "description", "")
-            # RSS summary içindeki HTML etiketlerini temizle (Telegram uyumu)
-            base_text  = re.sub(r'<[^>]+>', ' ', base_text or '')
-            base_text  = re.sub(r'\s+', ' ', base_text).strip()
+            # Metin kaynağı: makale gövdesi > summary > description
+            base_text = fetch_article_text(link) or getattr(e, "summary", "") or getattr(e, "description", "")
+            # RSS summary içi HTML temizliği
+            base_text = re.sub(r"<[^>]+>", " ", base_text or "")
+            base_text = re.sub(r"\s+", " ", base_text).strip()
 
+            # Özet + çeviri
             summary_en = summarize_en(base_text, SUMMARY_SENTENCES)
 
-            title_out   = translate_en_to_tr(title, is_title=True) if TRANSLATE_TITLES else title
-            text_tr     = translate_en_to_tr(summary_en, is_title=False) if TRANSLATE_SUMMARIES else summary_en
-            text_final  = bullets_tr(text_tr)
+            title_out  = translate_en_to_tr(title, is_title=True) if TRANSLATE_TITLES else title
+            text_tr    = translate_en_to_tr(summary_en, is_title=False) if TRANSLATE_SUMMARIES else summary_en
+            text_final = bullets_tr(text_tr)
+
+            # HTML kaçışları (Telegram parse_mode=HTML)
+            title_out  = escape_html(title_out)
+            text_final = escape_html(text_final)
 
             pub = publisher_of(link)
-            msg = f"{category}\n<b>{title_out}</b>\nKaynak: {pub} ({host_of(link)})\n\n{text_final}\n\n🔗 {link}"
+            msg = f"🟢 Platcorn & Creator\n<b>{title_out}</b>\nKaynak: {pub} ({host_of(link)})\n\n{text_final}\n\n🔗 {link}"
 
             try:
                 tg_send(msg)
                 mark_seen(conn, _id, title, link, category)
                 run_seen_links.add(link)
                 sent_total += 1
-                time.sleep(0.8)  # Telegram rate limit nazikliği
+                time.sleep(0.8)  # Telegram rate limit'e saygı
             except Exception as ex:
                 log(f"Gönderim hatası: {title} -> {ex}")
 
     log(f"Gönderilen yeni özet: {sent_total}")
 
 def main():
-    # GitHub Actions ortamında tek tur çalış (cron tetiklemeleri için)
+    # GitHub Actions içinde tek tur çalış
     if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
         run_once()
         return
-    # Aksi halde yerel/PA’de döngü
+    # Yerel/PA’de döngü
     if INTERVAL_SECONDS <= 0:
         run_once()
         return
