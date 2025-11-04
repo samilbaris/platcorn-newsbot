@@ -1,56 +1,42 @@
-name: Platcorn Newsbot
+name: Platcorn NewsBot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"     # her 5 dakikada bir
-  workflow_dispatch:          # elle tetikleme
+    # Her 15 dakikada bir çalışır
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [ main ]
 
 jobs:
-  run:
+  run-bot:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Repo’yu klonla
         uses: actions/checkout@v4
         with:
-          persist-credentials: false
+          token: ${{ secrets.PAT_TOKEN }}
 
-      - name: Set up Python
+      - name: Python ortamını kur
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Install deps
+      - name: Bağımlılıkları yükle
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Repo'da daha önceki state varsa runner'ın HOME'undaki ~/.newsbot'a kopyala
-      - name: Restore DB from repo state
-        run: |
-          mkdir -p ~/.newsbot
-          if [ -f state/seen.db ]; then cp -f state/seen.db ~/.newsbot/seen.db; fi || true
-
-      - name: Run bot
+      - name: Haber botunu çalıştır
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          HEALTHCHECK_URL:    ${{ secrets.HEALTHCHECK_URL }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
         run: |
           python main.py
 
-      # Çalışma sonrası yeni state'i repo içine kopyala ve commit/push yap
-      - name: Save state back to repo
+      - name: healthchecks.io’ya ping gönder
+        if: success()
         run: |
-          mkdir -p state
-          if [ -f ~/.newsbot/seen.db ]; then cp -f ~/.newsbot/seen.db state/seen.db; fi
-          git config user.name  "newsbot-bot"
-          git config user.email "newsbot-bot@users.noreply.github.com"
-          git add state/seen.db || true
-          git diff --quiet || git commit -m "update state [skip ci]"
-
-      - name: Push state
-        if: always()
-        env:
-          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: |
-          git push https://${PAT_TOKEN}@github.com/${{ github.repository }} HEAD:main
+          curl -fsS -m 10 --retry 5 ${{ secrets.HEALTHCHECK_URL }}
